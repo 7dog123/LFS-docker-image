@@ -1,0 +1,634 @@
+name: Linux From Scratch - multilib (LFS)
+
+on: [ push, pull_request ]
+env:
+  LFS: /mnt/lfs
+  # set 1 to run tests; running tests takes much more time
+  LFS_TEST: 1
+  # set 1 to install documentation; slightly increases final size
+  LFS_DOCS: 1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    
+    steps:
+      # Install the oackages for the host system required to build LFS
+      # The host system rquirements are listed here:
+      # https://www.linuxfromscratch.org/~thomas/multilib/chapter02/hostreqs.html
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison gawk texinfo python3
+          # The debian default shell points to dash,
+          # but LFS supports officially bash, so reset it.
+          sudo ls -s /bin/bash /bin/sh
+
+      - name: create lfs directory
+        run: sudo mkdir -p ${{ env.LFS }}
+        
+      - name: Creating a File System on the Partition 
+        run: |
+          sudo dd if=/dev/zero of=lfs-image count=2621440 bs=4096
+          sudo mkfs -v -t ext4 lfs-image
+          sudo mount -v -t ext4 lfs-image ${{ env.LFS }}
+
+      - name: Download packages
+        run: |
+          sudo mkdir -v ${{ env.LFS }}/sources
+          sudo chmod -v a+wt ${{ env.LFS }}
+          sudo wget -q https://www.linuxfromscratch.org/~thomas/multilib/wget-list-sysv
+          sudo wget -q --input-file=wget-list-sysv --continue --directory-prefix=${{ env.LFS }}/sources
+
+      - name: Creating a Limited Directory Layout in the LFS Filesystem 
+        run: |
+          sudo mkdir -pv $LFS/{etc,var} $LFS/usr/{bin,lib,sbin}
+          for i in bin lib sbin; do
+            sudo ln -sv usr/$i $LFS/$i
+          done
+          case $(uname -m) in
+            x86_64) sudo mkdir -pv $LFS/lib64 ;;
+          esac
+          sudo mkdir -pv $LFS/usr/lib{,x}32
+          sudo ln -sv usr/lib32 $LFS/lib32
+          sudo ln -sv usr/libx32 $LFS/libx32
+          sudo mkdir -pv $LFS/tools
+
+      - name: Adding the LFS User
+        run: |
+          sudo groupadd lfs || true
+          sudo useradd -s /bin/bash -g lfs -m -k /dev/null lfs || true
+          sudo chown -v lfs $LFS/{usr{,/*},lib,var,etc,bin,sbin,tools}
+          case $(uname -m) in
+            x86_64) sudo chown -v lfs $LFS/lib64 ;;
+          esac
+          sudo chown -v lfs $LFS/{lib32,libx32}
+
+      - name: Setting Up the Environment 
+        run: |
+          sudo su - lfs
+          cat > ~/.bash_profile << "EOF"
+          exec env -i HOME=$HOME TERM=$TERM PS1='\u:\w\$ ' /bin/bash
+          EOF
+          cat > ~/.bashrc << "EOF"
+          set +h
+          umask 022
+          LFS=/mnt/lfs
+          LC_ALL=POSIX
+          LFS_TGT=x86_64-lfs-linux-gnu
+          LFS_TGT32=i686-lfs-linux-gnu
+          LFS_TGTX32=x86_64-lfs-linux-gnux32
+          PATH=/usr/bin
+          if [ ! -L /bin ]; then PATH=/bin:$PATH; fi
+          PATH=$LFS/tools/bin:$PATH
+          CONFIG_SITE=$LFS/usr/share/config.site
+          export LFS LC_ALL LFS_TGT LFS_TGT32 LFS_TGTX32 PATH
+          EOF
+          # Several commercial distributions add an undocumented instantiation of /etc/bash.bashrc to the initialization of bash. This file has the 
+          # potential to modify the lfs user's environment in ways that can affect the building of critical LFS packages. To make sure the lfs user's
+          # environment is clean, check for the presence of /etc/bash.bashrc and, if present, move it out of the way. As the root user, run: 
+          [ ! -e /etc/bash.bashrc ] || sudo mv -v /etc/bash.bashrc /etc/bash.bashrc.NOUSE
+          cat >> ~/.bashrc << "EOF"
+          export MAKEFLAGS=-j$(nproc)
+          EOF
+
+      - name: Building the LFS Cross Toolchain and Temporary Tools 
+        run: |
+          sudo su - lfs
+          cd ${{ env.LFS }}/sources
+          source $HOME/.bashrc
+          echo "Installing binutils - first pass"
+          tar -xf binutils-*.tar.* -C /tmp/
+          mv /tmp/binutils-* /tmp/binutils
+          cd /tmp/binutils
+          mkdir -v build
+          cd build
+          ../configure --quiet --prefix=${{ env.LFS }}/tools \
+                       --with-sysroot=${{ env.LFS }} \
+                       --target=$LFS_TGT \
+                       --disable-nls \
+                       --enable-gprofng=no \
+                       --disable-werror \
+                       --enable-default-hash-style=gnu \
+                       --enable-multilib
+          make
+          sudo make --quiet install
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/binutils
+          echo "Installing GCC - first pass"
+          tar -xf gcc-*.tar.* -C /tmp/
+          mv /tmp/gcc-* /tmp/gcc
+          cd /tmp/gcc
+          tar -xf ${{ env.LFS }}/sources/mpfr-*.tar.*
+          mv -v mpfr-* mpfr
+          tar -xf ${{ env.LFS }}/sources/gmp-*.tar.*
+          mv -v gmp-* gmp
+          tar -xf ${{ env.LFS }}/sources/mpc-*.tar.*
+          mv -v mpc-* mpc
+          sed -e '/m64=/s/lib64/lib/' \
+              -e '/m32=/s/m32=.*/m32=..\/lib32$(call if_multiarch,:i386-linux-gnu)/' \
+              -i.orig gcc/config/i386/t-linux64
+          mkdir -v build
+          cd build 
+          mlist=m64,m32,mx32
+          ../configure --quiet --prefix=${{ env.LFS }}/tools \
+                       --target=$LFS_TGT \
+                       --with-glibc-version=2.39                      \
+                       --with-sysroot=${{ env.LFS }}                            \
+                       --with-newlib                                  \
+                       --without-headers                              \
+                       --enable-default-pie                           \
+                       --enable-default-ssp                           \
+                       --enable-initfini-array                        \
+                       --disable-nls                                  \
+                       --disable-shared                               \
+                       --enable-multilib --with-multilib-list=$mlist  \
+                       --disable-decimal-float                        \
+                       --disable-threads                              \
+                       --disable-libatomic                            \
+                       --disable-libgomp                              \
+                       --disable-libquadmath                          \
+                       --disable-libssp                               \
+                       --disable-libvtv                               \
+                       --disable-libstdcxx                            \
+                       --enable-languages=c,c++
+          make
+          sudo make --quiet install
+          cd ..
+          cat gcc/limitx.h gcc/glimits.h gcc/limity.h > \
+            `dirname $($LFS_TGT-gcc -print-libgcc-file-name)`/include/limits.h
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/gcc
+          echo "Installing Linux API headers"
+          tar -xf linux-*.tar.* -C /tmp
+          mv /tmp/linux-* /tmp/linux
+          cd /tmp/linux
+          make mrproper
+          make headers
+          find usr/include -type f ! -name '*.h' -delete
+          sudo cp -rv usr/include ${{ env.LFS }}/usr
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/linux
+          echo "Installing glibc"
+          tar -xf glibc-*.tar.* -C /tmp
+          mv /tmp/glibc-* /tmp/glibc
+          cd /tmp/glibc
+          sudo ln -sfv ../lib/ld-linux-x86-64.so.2 $LFS/lib64
+          sudo ln -sfv ../lib/ld-linux-x86-64.so.2 $LFS/lib64/ld-lsb-x86-64.so.3
+          patch -Np1 -i $LFS/sources/glibc-*-fhs-1.patch
+          mkdir build
+          cd build
+          echo "rootsbindir=/usr/sbin" > configparms
+          ../configure --quiet --prefix=/usr \
+                       --host=$LFS_TGT \
+                       --build=$(../scripts/config.guess) \
+                       --enable-kernel-4.19 \
+                       --with-headers=$LFS/usr/include \
+                       --disable-nscd \
+                       libc_cv_slibdir=/usr/lib
+          make -j1
+          sudo make --quiet DESTDIR=$LFS install -j1
+          sed '/RTLDLIST=/s@/usr@@g' -i $LFS/usr/bin/ldd
+          echo 'int main(){}' | $LFS_TGT-gcc -xc -
+          readelf -l a.out | grep ld-linux
+          make clean
+          find .. -name "*.a" -delete
+          echo "Installing glibc - 32 bit"
+          CC="$LFS_TGT-gcc -m32" \
+          CXX="$LFS_TGT-g++ -m32" \
+          ../configure --quiet --prefix=/usr \
+                       --host=$LFS_TGT32 \
+                       --build=$(../scripts/config.guess) \
+                       --enable-kernel=4.19 \
+                       --with-headers=$LFS/usr/include \
+                       --disable-nscd \
+                       --libdir=/usr/lib32 \
+                       --libexecdir=/usr/lib32 \
+                       libc_cv_slibdir=/usr/lib32
+          make -j1
+          sudo make --quiet DESTDIR=$PWD/DESTDIR install
+          sudo cp -a DESTDIR/usr/lib32 $LFS/usr/
+          install -vm644 DESTDIR/usr/include/gnu/{lib-names,stubs}-32.h \
+                         $LFS/usr/include/gnu/
+          sudo ln -svf ../lib32/ld-linux.so.2 $LFS/lib/ld-linux.so.2
+          echo 'int main(){}' > dummy.c
+          $LFS_TGT-gcc -m32 dummy.c
+          readelf -l a.out | grep '/ld-linux'
+          rm -rf dummy.c a.out
+          make clean
+          find .. -name "*.a" -delete
+          echo "Installing glibc - x32bit"
+          CC="$LFS_TGT-gcc -mx32" \
+          CXX="$LFS_TGT-g++ -mx32" \
+          ../configure --quiet --prefix=/usr \
+                       --host=$LFS_TGTX32 \
+                       --build=$(../scripts/config.guess) \
+                       --enable-kernel=4.19 \
+                       --with-headers=$LFS/usr/include \
+                       --disable-nscd \
+                       --libdir=/usr/libx32 \
+                       --libexecdir=/usr/libx32 \
+                       libc_cv_slibdir=/usr/libx32
+          make -j1
+          sudo make --quiet DESTDIR=$PWD/DESTDIR install
+          sudo cp -a DESTDIR/usr/libx32 $LFS/usr/
+          install -vm644 DESTDIR/usr/include/gnu/{lib-names,stubs}-x32.h \
+                         $LFS/usr/include/gnu/
+          sudo ln -svf ../libx32/ld-linux-x32.so.2 $LFS/lib/ld-linux-x32.so.2
+          echo 'int main(){}' > dummy.c
+          $LFS_TGT-gcc -mx32 dummy.c
+          readelf -l a.out | grep '/ls-linux-x32'
+          rm -v dummy.c a.out
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/glibc
+          echo "Installing GCC libstdcxx-v3"
+          tar -xf gcc-*.tar.* -C /tmp/
+          mv /tmp/gcc-* /tmp/gcc
+          cd /tmp/gcc
+          mkdir -v build
+          cd build
+          ../libstdc++-v3/configure --prefix=/usr \
+                                    --host=$LFS_TGT \
+                                    --build=$(../configure --quiet.guess \
+                                    --enable-multilib \
+                                    --disable-nls \
+                                    --disable-libstdcxx-pch \
+                                    --with-gxx-include-dir=/tools/$LFS_TGT/include/c++/14.1.0
+           make
+           sudo make --quiet DESTDIR=$LFS install
+           rm -v $LFS/usr/lib/lib{stdc++{,exp,fs},supc++}.la
+           cd $LFS/sources
+           rm -rf /tmp/gcc
+
+      - name: Cross Compiling Temporary Tools
+        run: |
+          sudo su - lfs
+          cd ${{ env.LFS }}/sources
+          source $HOME/.bashrc
+          echo "Installing m4"
+          tar -xf m4-*.tar.* -C /tmp
+          mv /tmp/m4-* /tmp/m4
+          cd /tmp/m4
+          ./configure --quiet --prefix/usr \
+                      --host=$LFS_TGT \
+                      --build=$(build-aux/config.guess
+          make
+          if [ ${{ env.LFS_TEST }} -eq 1 ]; then make check; fi
+          sudo make --quiet install
+          cd ${{ env.LFS }}/sources
+          tar -xf ncurses-*.tar.* -C /tmp
+          mv /tmp/ncurses-* /tmp/ncurse
+          echo "Installing ncurses"
+          cd /tmp/ncurses
+          sed -i s/mawk// configure
+          mkdir build
+          cd build
+          ../configure --quiet
+          make -C include
+          make -C progs tic
+          cd ..
+          ./configure --quiet --prefix=/usr                \
+                      --host=$LFS_TGT              \
+                      --build=$(./config.guess)    \
+                      --mandir=/usr/share/man      \
+                      --with-manpage-format=normal \
+                      --with-shared                \
+                      --without-normal             \
+                      --with-cxx-shared            \
+                      --without-debug              \
+                      --without-ada                \
+                      --disable-stripping
+          make
+          sudo make --quiet DESTDIR=$LFS TIC_PATH=$(pwd)/build/progs/tic install
+          sudo ln -sv libncursesw.so $LFS/usr/lib/libncurses.so
+          sed -e 's/^#if.*XOPEN.*$/#if 1/' \
+              -i $LFS/usr/include/curses.h
+          make distclean
+          echo "Installing ncurse - 32bit"
+          CC="$LFS_TGT-gcc -m32"              \
+          CXX="$LFS_TGT-g++ -m32"             \
+          ./configure --quiet --prefix=/usr           \
+                      --host=$LFS_TGT32       \
+                      --build=$(./config.guess)    \
+                      --libdir=/usr/lib32     \
+                      --mandir=/usr/share/man \
+                      --with-shared           \
+                      --without-normal        \
+                      --with-cxx-shared       \
+                      --without-debug         \
+                      --without-ada           \
+                      --disable-
+          make
+          sudo make --quiet DESTDIR=$PWD/DESTDIR TIC_PATH=$(pwd)/build/progs/tic install
+          sudo ln -sv libncursesw.so DESTDIR/usr/lib32/libncurses.so
+          sudo cp -Rv DESTDIR/usr/lib32/* $LFS/usr/lib32
+          rm -rf DESTDIR
+          echo "Installing ncurse - x32bit"
+          CC="$LFS_TGT-gcc -mx32"             \
+          CXX="$LFS_TGT-g++ -mx32"            \
+          ./configure --quiet --prefix=/usr           \
+                      --host=$LFS_TGTX32      \
+                      --build=$(./config.guess)    \
+                      --libdir=/usr/libx32    \
+                      --mandir=/usr/share/man \
+                      --with-shared           \
+                      --without-normal        \
+                      --with-cxx-shared       \
+                      --without-debug         \
+                      --without-ada           \
+                      --disable-stripping
+          make
+          sudo make --quiet DESTDIR=$PWD/DESTDIR TIC_PATH=$(pwd)/build/progs/tic install
+          sudo ln -sv libncursesw.so DESTDIR/usr/libx32/libncurses.so
+          sudo cp -Rv DESTDIR/usr/libx32/* $LFS/usr/libx32
+          rm -rf DESTDIR
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/ncurse
+          tar -xf bash-*.tar.* -C /tmp
+          mv /tmp/bash-* /tmp/bash
+          cd /tmp/bash
+          ./configure --quiet --prefix=/usr \
+                      --build=$(sh support/config.guess) \
+                      --host=$LFS_TGT \
+                      --without-bash-malloc \
+                      bash_cv_strtold_broken=no
+          make
+          if [ ${{ env.LFS_TEST }} - eq 1 ]; then make tests; fi
+          sudo make --quiet DESTDIR=$LFS install
+          sudo ln -sv bash $LFS/bin/sh
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/bash
+          tar -xf coreutils-*.tar.* -C /tmp
+          mv /tmp/coreutils-* /tmp/coreutils
+          cd tmp/coreutils
+          ../configure --quiet --prefix=/usr \
+                       --host=$LFS_TGT \
+                       --build=$(build-aux/config.guess) \
+                       --enable-install-program=hostname \
+                       --enable-no-install-program=kill,uptime
+          make
+          if [ $TFS_TEST == "y" ]; then make RUN_EXPENSIVE_TESTS=yes check || true; fi
+          sudo make --quiet DESTDIR=$LFS install
+          sudo mv -v $LFS/usr/bin/chroot              $LFS/usr/sbin
+          sudo mkdir -pv $LFS/usr/share/man/man8
+          sudo mv -v $LFS/usr/share/man/man1/chroot.1 $LFS/usr/share/man/man8/chroot.8
+          sudo sed -i 's/"1"/"8"/'                    $LFS/usr/share/man/man8/chroot.8
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/coreutils
+          echo "Installing Diffutils"
+          tar -xf diffutils-*.tar.* -C /tmp
+          mv /tmp/diffutils-* /tmp/diff
+          cd /tmp/diff
+          ./configure --quiet --prefix=/usr \
+                      --host=$LFS_TGT \
+                      --build=$(./build-aux/config.guess)
+          make
+          if [ ${{ env.LFS_TEST }} -eq 1 ]; then make check; fi
+          sudo make --quiet DESTDIR=$LFS install
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/diff
+          echo "Installing File"
+          tar -xf file-*.tar.* -C /tmp
+          mv /tmp/file-* /tmp/file
+          cd /tmp/file
+          mkdir build
+          cd build
+          ../configure --quiet --disable-bzlib \
+                       --disable-libseccomp \
+                       --disable-xzlib \
+                       --disable-zlib
+          make
+          cd ..
+          ./configure --quiet --prefix=/usr --host=$LFS_TGT --build=$(./config.guess)
+          make FILE_COMPILE=$(pwd)/build/src/file
+          if [ ${{ env.LFS_TEST }} -eq 1 ]; then make check; fi
+          sudo make --quiet DESTDIR=$LFS install
+          rm -v $LFS/usr/lib/libmagic.la
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/file
+          echo "Installing findutils"
+          tar -xf findutils-*.tar.* -C /tmp
+          mv /tmp/findutils-* /tmp/findutils
+          cd /tmp/findutils
+          ./configure --quiet --prefix=/usr \
+                      --localstatedir=/var/lib/locate \
+                      --host=$LFS_TGT \
+                      --build=$(build-aux/config.guess)
+          make
+          if [ ${{ env.LFS_TEST }} -eq 1 ]; then make check; fi || true
+          sudo make --quiet DESTDIR=$LFS install
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/findutils
+          echo "Installing gawk"
+          tar -xf gawk-*.tar.* -C /tmp
+          mv /tmp/gawk-* /tmp/gawk
+          cd /tmp/gawk
+          sed -i 's/extras//' Makefile.in
+          ./configure --quiet --prefix=/usr \
+                      --host=$LFS_TGT \
+                      --build=$(build-aux/config.guess)
+          make
+          if [ ${{ env.LFS_TEST }} -eq 1 ]; then make check || true; fi
+          sudo make --quiet DESTDIR=$LFS install
+          cd ${{ env.LFS }}/sources
+          rm /tmp/findutils
+          echo "Installing Grep"
+          tar -xf grep-*.tar.* -C /tmp
+          mv tmp/grep-* /tmp/grep
+          cd /tmp/grep
+          ./configure --quiet --prefix=/usr \
+                      --host=$LFS_TGT \
+                      --build=$(build-aux/config.guess)
+          make
+          if [ ${{ env.LFS_TEST }} -eq 1 ]; then make check || true; fi
+          sudo make --quiet DESTDIR=$LFS install
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/grep
+          echo "Installing Gzip"
+          tar -xf gzip-*.tar.* -C /tmp
+          mv /tmp/gzip-* /tmp/gzip
+          cd /tmp/gzip
+          ./configure --quiet --prefix=/usr \
+                      --host=$LFS_TGT \
+          make
+          if  [ "${{ env.LFS_TEST }}" == "y" ]; then make check || true; fi
+          sudo make --quiet DESTDIR=$LFS install
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/gzip
+          echo "Installing Make"
+          tar -xf make-*.tar.* -C /tmp/
+          mv /tmp/make-* /tmp/make
+          cd /tmp/make
+          ./configure --quiet --prefix=/usr \
+                      --without-guile
+                      --host=$LFS_TGT \
+                      --build=$(build-aux/config.guess)
+          make
+          if [ ${{ env.LFS_TEST }} -eq 1 ]; then make check || true; fi
+          sudo make --quiet DESTDIR=$LFS install
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/make
+          echo "Installing Patch"
+          tar -xf patch-*.tar.* -C /tmp
+          mv /tmp/patch-* /tmp/patch
+          cd /tmp/patch
+          ./configure --quiet --prefix=/usr \
+                      --host=$LFS_TGT \
+                      --build=$(build-aux/config.guess)
+          make
+          if [ ${{ env.LFS_TEST }} -eq 1 ]; then make check || true; fi
+          sudo make --quiet DESTDIR=$LFS install
+          cd ${{ env.LFS }}/
+          echo "Installing Sed"
+          tar -xf sed-*.tar.* -C /tmp
+          mv /tmp/sed-* /tmp/sed
+          cd /tmp/sed
+          ./configure --quiet --prefix=/usr \
+                      --host=$LFS_TGT \
+                      --build=$(build-aux/config.guess)
+          make
+          if [ ${{ env.LFS_TEST }} -eq 1 ]; then make check || true; fi
+          sudo make --quiet DESTDIR=$LFS install
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/sed
+          echo "Installing Tar"
+          tar -xf tar-*.tar.* -C /tmp
+          mv /tmp/tar-* /tmp/tar
+          cd /tmp/tar
+          ./configure --quiet --prefix=/usr \
+                      --host=$LFS_TGT \
+                      --build=$(build-aux/config.guess)
+          make
+          if [ ${{ env.LFS_TEST }} -eq 1 ]; then make check || true; fi
+          sudo make --quiet DESTDIR=$LFS install
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/tar
+          tar -xf xz-*.tar.* -C /tar
+          echo "Installing Xz"
+          mv /tmp/xz-* /tmp/xz
+          ./configure --quiet --prefix=/usr \
+                      --host=$LFS_TGT \
+                      --build=$(build-aux/config.guess) \
+                      --disable-static \
+                      --docdir=/usr/share/doc/xz-5.6.2
+          make
+          if [ ${{ env.LFS_TEST }} -eq 1 ]; then make check || true; fi
+          sudo make --quiet DESTDIR=$LFS install
+          rm -v $LFS/usr/lib/liblzma.la
+          cd ${{ env.LFS }}/sources
+          echo Installing binutils - second pass
+          tar -xf binutils-* -C /tmp
+          mv /tmp/binutils-* /tmp/binutils
+          cd /tmp/binutils
+          sed '6009s/$add_dir//' -i ltmain.sh
+          mkdir -v build
+          cd build
+          ../configure --quiet --prefix=/usr \
+                       --build=$(../config.guess) \
+                       --host=$LFS_TGT            \
+                       --disable-nls              \
+                       --enable-shared            \
+                       --enable-gprofng=no        \
+                       --disable-werror           \
+                       --enable-64-bit-bfd        \
+                       --enable-default-hash-style=gnu \
+                       --enable-multilib
+          make
+          sudo make --quiet DESTDIR=$LFS install
+          rm -v $LFS/usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes,sframe}.{a,la}
+          cd ${{ env.LFS }}/sources
+          rm -rf /tmp/binutils
+          echo "Installing GCC - second pass"
+          tar -xf gcc-*.tar.* -C /tmp/
+          mv /tmp/gcc-* /tmp/gcc
+          cd /tmp/gcc
+          tar -xf ${{ env.LFS }}/sources/mpfr-*.tar.*
+          mv -v mpfr-* mpfr
+          tar -xf ${{ env.LFS }}/sources/gmp-*.tar.*
+          mv -v gmp-* gmp
+          tar -xf ${{ env.LFS }}/sources/mpc-*.tar.*
+          mv -v mpc-* mpc
+          sed -e '/m64=/s/lib64/lib/' \
+              -e '/m32=/s/m32=.*/m32=..\/lib32$(call if_multiarch,:i386-linux-gnu)/' \
+              -i.orig gcc/config/i386/t-linux64
+          sed '/thread_header =/s/@.*@/gthr-posix.h/' \
+              -i libgcc/Makefile.in libstdc++-v3/include/Makefile.in
+           mkdir -v build
+           cd build
+           mlist=m64,m32,mx32
+           ../configure --quiet --prefix=/usr \
+                        --build=$(../config.guess)                     \
+                        --host=$LFS_TGT                                \
+                        --target=$LFS_TGT                              \
+                        LDFLAGS_FOR_TARGET=-L$PWD/$LFS_TGT/libgcc      \
+                        --with-build-sysroot=$LFS                      \
+                        --enable-default-pie                           \
+                        --enable-default-ssp                           \
+                        --disable-nls                                  \
+                        --enable-multilib --with-multilib-list=$mlist  \
+                        --disable-libatomic                            \
+                        --disable-libgomp                              \
+                        --disable-libquadmath                          \
+                        --disable-libsanitizer                         \
+                        --disable-libssp                               \
+                        --disable-libvtv                               \
+                        --enable-languages=c,c++
+           make
+           sudo make --quiet DESTDIR=$LFS install
+           sudo ln -sv gcc $LFS/usr/bin/cc
+           
+      - name: Changing Ownership
+        run: |
+          sudo su - lfs
+          source $HOME/.bashrc
+          sudo chown --from -R root:root $LFS/{usr,lib,var,etc,bin,sbin,tools}
+          case $(uname -m) in
+            x86_64) sudo chown -from lfs -R root:root $LFS/lib64 ;;
+          esac
+          sudo chown -R root:root $LFS/lib32
+          sudo chown -R root:root $LFS/libx32
+
+      - name: Preparing Virtual Kernel File System
+        run: |
+          sudo su - lfs
+          source $HOME/.bashrc
+          sudo mkdir -pv $LFS/[dev,proc,sys,run}
+          sudo mount -v --bind /dev/$LFS/dev
+          sudo mount -vt devpts devpts -o gid=5,mode=0620 $LFS/dev/pts
+          sudo mount -vt proc proc $LFS/proc
+          sudo mount -vt sysfs sysfs $LFS/sys
+          sudo mount -vt tmpfs tmpfs $LFS/run
+          if [ -h $LFS/dev/shm ]; then 
+            install -v -d -m 1777 $LFS$(realpath /dev/shm)
+          else
+            mount -vt tmpfs -o nosuid,nodev tmpfs $LFS/dev
+          fi
+          
+      - name: Creating Directories
+        run: |
+          sudo su - lfs
+          source $HOME/.bashrc
+          chroot "$LFS" /usr/bin/env -i \
+              $HOME=/root \
+              TERM="TERM" \
+              PS1='(lfs chroot) \u:\w\$' \
+              PATH=/usr/bin:/usr/sbin \
+              MAKEFLAGS="-j$(nproc)" \
+              TESTSUITEFLAGS="-j$(nproc)" \
+              /sbin/bash --login
+          mkdir -pv /{boot,home,mnt,opt,srv}
+          mkdir -pv /etc/{opt,sysconfig}
+          mkdir -pv /lib/firmware
+          mkdir -pv /media/{floppy,cdrom}
+          mkdir -pv /usr/{,local/}{include,src}
+          mkdir -pv /usr/lib/locale
+          mkdir -pv /usr/local/{bin,lib,sbin}
+          mkdir -pv /usr/{,local/}share/{color,dict,doc,info,locale,man}
+          mkdir -pv /usr/{,local/}share/{misc,terminfo,zoneinfo}
+          mkdir -pv /usr/{,local/}share/man/man{1..8}
+          mkdir -pv /var/{cache,local,log,mail,opt,spool}
+          mkdir -pv /var/lib/{color,misc,locate}
+          ln -svf /run /var/run
+          ln -sfv /run/lock /var/lock
+          install -dv -m 0750 /root
+          install -dv -m 1777 /tmp var/tmp
