@@ -179,6 +179,8 @@ jobs:
           mkdir build
           cd build
           echo "rootsbindir=/usr/sbin" > configparms
+          CC="$LFS/tool/bin/$LFS_TGT-gcc" \
+          CXX="$LFS/tool/bin/$LFS_TGT-g++" \
           ../configure --quiet --prefix=/usr \
                        --host=$LFS_TGT \
                        --build=$(../scripts/config.guess) \
@@ -194,8 +196,8 @@ jobs:
           make clean
           find .. -name "*.a" -delete
           echo "Installing glibc - 32 bit"
-          CC="$LFS_TGT-gcc -m32" \
-          CXX="$LFS_TGT-g++ -m32" \
+          CC="$LFS/tool/bin/$LFS_TGT-gcc -m32" \
+          CXX="$LFS/tool/bin/$LFS_TGT-g++ -m32" \
           ../configure --quiet --prefix=/usr \
                        --host=$LFS_TGT32 \
                        --build=$(../scripts/config.guess) \
@@ -218,8 +220,8 @@ jobs:
           make clean
           find .. -name "*.a" -delete
           echo "Installing glibc - x32bit"
-          CC="$LFS_TGT-gcc -mx32" \
-          CXX="$LFS_TGT-g++ -mx32" \
+          CC="$LFS/tool/bin/$LFS_TGT-gcc -mx32" \
+          CXX="$LFS/tool/bin/$LFS_TGT-g++ -mx32" \
           ../configure --quiet --prefix=/usr \
                        --host=$LFS_TGTX32 \
                        --build=$(../scripts/config.guess) \
